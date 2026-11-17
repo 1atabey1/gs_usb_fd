@@ -1,6 +1,6 @@
 [project]
 name = "python-can-gs-usb-fd"
-version = "0.1.0"
+version = "0.2.0"
 description = "python-can interface for CAN FD over gs_usb devices (tricore-debug-machine probe, candleLight FD)"
 readme = "README.md"
 requires-python = ">=3.10"

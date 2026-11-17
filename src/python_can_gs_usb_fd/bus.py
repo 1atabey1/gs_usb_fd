@@ -14,7 +14,7 @@ import usb.core
 
 from . import device as _device
 from . import protocol as p
-from .device import GsUsbDevice, _serial
+from .device import GsUsbDevice
 
 INTERFACE = "gs_usb_fd"
 DEFAULT_SAMPLE_POINT = 80.0
@@ -23,7 +23,8 @@ DEFAULT_SAMPLE_POINT = 80.0
 def parse_channel(channel: Any) -> tuple[str | None, int]:
     """0, "0" -> (None, 0): channel 0 of the first device found;
     "SERIAL@1" -> ("SERIAL", 1). Channels are 0-based, as the device numbers
-    them (on the tricore-debug-machine probe 0 is CAN1 / J4, 1 is CAN2 / J5)."""
+    them (on the tricore-debug-machine probe 0 is CAN1 / J4, 1 is CAN2 / J5),
+    counted across the device's gs_usb interfaces when it has several."""
     if channel is None:
         return None, 0
     if isinstance(channel, int):
@@ -87,7 +88,8 @@ class GsUsbFdBus(can.BusABC):
         self._channel_open = False  # this bus registered its channel with the device
         serial, self._ch = parse_channel(channel)
         try:
-            self._dev = GsUsbDevice.acquire(serial)
+            # _local: the channel's number on its interface (what the wire carries)
+            self._dev, self._local = GsUsbDevice.acquire_channel(serial, self._ch)
         except (LookupError, usb.core.USBError, usb.core.NoBackendError) as e:
             raise can.CanInitializationError(f"{INTERFACE}: {e}") from e
         try:
@@ -111,9 +113,6 @@ class GsUsbFdBus(can.BusABC):
     def _setup(self, timing, bitrate, data_bitrate, sample_point, data_sample_point,
                listen_only, loopback, one_shot, error_frames, hw_timestamps) -> None:
         dev = self._dev
-        if not 0 <= self._ch < dev.channel_count:
-            raise can.CanInitializationError(
-                f"{INTERFACE}: channel {self._ch} out of range, {dev.serial} has {dev.channel_count}")
         btc = dev.bt_const
         fclk = btc.fclk_can
 
@@ -151,22 +150,22 @@ class GsUsbFdBus(can.BusABC):
         # Claim the channel first: a channel another bus has open must not be
         # reset or retimed under it.
         try:
-            self._queue = dev.open_channel(self._ch, hw_timestamps)
+            self._queue = dev.open_channel(self._local, hw_timestamps)
         except RuntimeError as e:
             raise can.CanInitializationError(f"{INTERFACE}: {e}") from e
         self._channel_open = True
         try:
-            dev.ctrl_out(p.BREQ_MODE, p.pack_mode(p.MODE_RESET, 0), value=self._ch)
+            dev.ctrl_out(p.BREQ_MODE, p.pack_mode(p.MODE_RESET, 0), value=self._local)
             if self._fd:
                 t = self.timing
                 dev.ctrl_out(p.BREQ_BITTIMING, p.pack_bittiming(t.nom_tseg1, t.nom_tseg2, t.nom_sjw, t.nom_brp),
-                             value=self._ch)
+                             value=self._local)
                 dev.ctrl_out(p.BREQ_DATA_BITTIMING,
-                             p.pack_bittiming(t.data_tseg1, t.data_tseg2, t.data_sjw, t.data_brp), value=self._ch)
+                             p.pack_bittiming(t.data_tseg1, t.data_tseg2, t.data_sjw, t.data_brp), value=self._local)
             else:
                 t = self.timing
-                dev.ctrl_out(p.BREQ_BITTIMING, p.pack_bittiming(t.tseg1, t.tseg2, t.sjw, t.brp), value=self._ch)
-            dev.ctrl_out(p.BREQ_MODE, p.pack_mode(p.MODE_START, flags), value=self._ch)
+                dev.ctrl_out(p.BREQ_BITTIMING, p.pack_bittiming(t.tseg1, t.tseg2, t.sjw, t.brp), value=self._local)
+            dev.ctrl_out(p.BREQ_MODE, p.pack_mode(p.MODE_START, flags), value=self._local)
             self._started = True
         except usb.core.USBError as e:
             raise can.CanInitializationError(f"{INTERFACE}: {e}") from e
@@ -180,7 +179,7 @@ class GsUsbFdBus(can.BusABC):
         if msg.is_remote_frame:
             can_id |= p.CAN_RTR_FLAG
         data = bytes(msg.data)
-        frame = p.pack_frame(next(self._echo_ids) & 0x7FFFFFFF, can_id, self._ch, data, fd=msg.is_fd,
+        frame = p.pack_frame(next(self._echo_ids) & 0x7FFFFFFF, can_id, self._local, data, fd=msg.is_fd,
                              brs=msg.bitrate_switch, esi=msg.error_state_indicator,
                              dlc=None if msg.is_fd or not msg.is_remote_frame else msg.dlc)
         try:
@@ -256,7 +255,7 @@ class GsUsbFdBus(can.BusABC):
     def error_counters(self) -> tuple[int, int, int]:
         """(state, rx error count, tx error count) from GET_STATE."""
         try:
-            return struct.unpack("<3I", self._dev.ctrl_in(p.BREQ_GET_STATE, 12, value=self._ch))
+            return struct.unpack("<3I", self._dev.ctrl_in(p.BREQ_GET_STATE, 12, value=self._local))
         except usb.core.USBError as e:
             raise can.CanOperationError(f"{INTERFACE}: {e}") from e
 
@@ -266,12 +265,12 @@ class GsUsbFdBus(can.BusABC):
             return
         if self._started:
             try:
-                self._dev.ctrl_out(p.BREQ_MODE, p.pack_mode(p.MODE_RESET, 0), value=self._ch)
+                self._dev.ctrl_out(p.BREQ_MODE, p.pack_mode(p.MODE_RESET, 0), value=self._local)
             except usb.core.USBError:
                 pass
             self._started = False
         if self._channel_open:
-            self._dev.close_channel(self._ch)
+            self._dev.close_channel(self._local)
             self._channel_open = False
         self._dev.release()
         self._dev = None
@@ -283,22 +282,28 @@ class GsUsbFdBus(can.BusABC):
     # ---- discovery
     @staticmethod
     def _detect_available_configs() -> list[can.typechecking.AutoDetectedConfig]:
+        """Every FD channel of every device that can be opened now. Channels
+        on an interface another process has open are left out (they count
+        as one channel each for the numbering, see device.py)."""
         configs: list[can.typechecking.AutoDetectedConfig] = []
         try:
-            usb_devs = _device.find_usb_devices()
+            ports = _device.find_ports()
         except usb.core.NoBackendError:
             return configs
-        for u in usb_devs:
-            serial = _serial(u)
-            try:
-                dev = GsUsbDevice.acquire(serial, usb_dev=u)
-            except (LookupError, usb.core.USBError):
-                continue  # in use by another process, or not a gs_usb device
-            try:
-                if not dev.bt_const.feature & p.FEATURE_FD:
+        for serial, refs in _device.ports_by_serial(ports).items():
+            base = 0
+            for ref in refs:
+                try:
+                    with GsUsbDevice._registry_lock:
+                        dev = GsUsbDevice.acquire_port(ref)
+                except (LookupError, usb.core.USBError):
+                    base += 1  # in use by another process, or not a gs_usb interface
                     continue
-                for ch in range(dev.channel_count):
-                    configs.append({"interface": INTERFACE, "channel": f"{serial}@{ch}"})
-            finally:
-                dev.release()
+                try:
+                    if dev.bt_const.feature & p.FEATURE_FD:
+                        configs.extend({"interface": INTERFACE, "channel": f"{serial}@{base + ch}"}
+                                       for ch in range(dev.channel_count))
+                    base += dev.channel_count
+                finally:
+                    dev.release()
         return configs
