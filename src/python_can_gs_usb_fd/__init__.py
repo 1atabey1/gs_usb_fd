@@ -8,4 +8,4 @@ without importing anything from here.
 from .bus import INTERFACE, GsUsbFdBus, parse_channel
 
 __all__ = ["INTERFACE", "GsUsbFdBus", "parse_channel"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

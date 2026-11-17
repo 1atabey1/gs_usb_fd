@@ -135,3 +135,46 @@ def test_wrong_clock_timing_is_adjusted_or_refused(fake):
         bus = can.Bus(interface="gs_usb_fd", channel=0, timing=t40)
     with bus:
         assert bus.timing.f_clock == 80_000_000 and bus.timing.nom_bitrate == 500_000
+
+
+# ---- several gs_usb interfaces (the tricore-debug-machine probe's split layout)
+
+def test_split_layout_maps_channels_onto_interfaces(fake_split):
+    t = can.BitTimingFd(**PCAN)
+    with can.Bus(interface="gs_usb_fd", channel=0, timing=t) as can1, \
+            can.Bus(interface="gs_usb_fd", channel=1, timing=t, loopback=True) as can2:
+        # channel 1 is local channel 0 of interface 4: requests carry wValue 0 there
+        assert fake_split.mode[1][0] == p.MODE_START and fake_split.mode[1][1] & p.FEATURE_LOOP_BACK
+        assert fake_split.mode[0][0] == p.MODE_START
+        fake_split.inject(0, 0x111, b"\x01")
+        fake_split.inject(1, 0x222, b"\x02")
+        m1, m2 = can1.recv(1.0), can2.recv(1.0)
+        assert (m1.arbitration_id, m1.channel) == (0x111, 0)
+        assert (m2.arbitration_id, m2.channel) == (0x222, 1)   # the device's channel number
+        can2.send(can.Message(arbitration_id=0x333, data=b"\x03"))
+        assert can2.recv(1.0).arbitration_id == 0x333
+        assert p.HEADER.unpack_from(fake_split.written[-1])[3] == 0   # local channel on the wire
+        assert can1.recv(0.2) is None
+        assert len(type(can1._dev)._registry) == 2   # one open port per interface
+    assert fake_split.mode[0] == (p.MODE_RESET, 0) and fake_split.mode[1] == (p.MODE_RESET, 0)
+
+
+def test_split_layout_with_an_interface_held_elsewhere(fake_split):
+    """Another process holds interface 0 (CAN1): CAN2 still opens, and CAN1
+    reports busy."""
+    fake_split.busy.add(0)
+    t = can.BitTimingFd(**PCAN)
+    with can.Bus(interface="gs_usb_fd", channel=1, timing=t) as can2:
+        assert fake_split.mode[1][0] == p.MODE_START
+        with pytest.raises(can.CanInitializationError, match="busy"):
+            can.Bus(interface="gs_usb_fd", channel=0, timing=t)
+    assert can.detect_available_configs(interfaces=["gs_usb_fd"]) == [
+        {"interface": "gs_usb_fd", "channel": "FAKE0001@1"}]
+
+
+def test_split_layout_detect_and_range(fake_split):
+    assert can.detect_available_configs(interfaces=["gs_usb_fd"]) == [
+        {"interface": "gs_usb_fd", "channel": "FAKE0001@0"},
+        {"interface": "gs_usb_fd", "channel": "FAKE0001@1"}]
+    with pytest.raises(can.CanInitializationError, match="out of range"):
+        can.Bus(interface="gs_usb_fd", channel=2, bitrate=500_000)
